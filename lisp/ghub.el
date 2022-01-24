@@ -497,37 +497,67 @@ a while already.)
 For more information see https://github.com/magit/ghub/issues/81
 and https://debbugs.gnu.org/cgi/bugreport.cgi?bug=34341.")
 
-(cl-defun ghub--retrieve (payload req)
-  (let ((url-request-extra-headers
-         (let ((headers (ghub--req-headers req)))
-           (if (functionp headers) (funcall headers) headers)))
-        (url-request-method (ghub--req-method req))
-        (url-request-data payload)
-        (url-show-status nil)
-        (url     (ghub--req-url req))
-        (handler (ghub--req-handler req))
-        (silent  (ghub--req-silent req))
-        (gnutls-algorithm-priority
-         (if (and ghub-use-workaround-for-emacs-bug
-                  (or (eq ghub-use-workaround-for-emacs-bug 'force)
-                      (and (not gnutls-algorithm-priority)
-                           (>= libgnutls-version 30603)
-                           (or (version<= emacs-version "26.2")
-                               (eq system-type 'darwin))
-                           (memq (ghub--req-forge req) '(github nil)))))
-             "NORMAL:-VERS-TLS1.3"
-           gnutls-algorithm-priority)))
-    (if (or (ghub--req-callback  req)
-            (ghub--req-errorback req))
-        (url-retrieve url handler (list req) silent)
-      (with-current-buffer
-          (url-retrieve-synchronously url silent)
-        (funcall handler (car url-callback-arguments) req)))))
+(require 'request)
 
-(defun ghub--handle-response (status req)
-  (let ((buffer (current-buffer)))
-    (unwind-protect
-        (progn
+(setq deferred:debug-on-signal t)
+
+(cl-defun handler (req &key response &allow-other-keys)
+  (with-temp-buffer
+    (let* ((err (request-response-error-thrown response))
+          (status (if err (plist-put '() :error err) '()))
+          (buffer (current-buffer)))
+      (insert    (s-join "\n" (cl-loop for (k . v) in (request-response-headers response)
+                                       collect (format "%s: %s" k v))))
+      (setq-local url-http-end-of-headers (point))
+      (insert "\n\n")
+      (setq-local url-http-response-status (request-response-status-code response))
+      (insert (request-response-data response))
+      (ghub--handle-response buffer status req))))
+
+(cl-defun ghub--retrieve (payload req)
+  (let* ((url-request-extra-headers
+          (let ((headers (ghub--req-headers req)))
+            (if (functionp headers) (funcall headers) headers)))
+         (url-request-method (ghub--req-method req))
+         (url-request-data payload)
+         (url-show-status nil)
+         (url     (ghub--req-url req))
+         (silent  (ghub--req-silent req))
+         (gnutls-algorithm-priority
+          (if (and ghub-use-workaround-for-emacs-bug
+                   (or (eq ghub-use-workaround-for-emacs-bug 'force)
+                       (and (not gnutls-algorithm-priority)
+                            (>= libgnutls-version 30603)
+                            (or (version<= emacs-version "26.2")
+                                (eq system-type 'darwin))
+                            (memq (ghub--req-forge req) '(github nil)))))
+              "NORMAL:-VERS-TLS1.3"
+            gnutls-algorithm-priority))
+         (sync (if (or (ghub--req-callback  req) (ghub--req-errorback req)) nil t))
+         (resp (request (url-recreate-url url)
+                 :sync sync
+                 :headers url-request-extra-headers
+                 :type url-request-method
+                 :data url-request-data
+                 :parser #'buffer-string
+                 :error
+                 (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
+                                (message "Got error: %S" error-thrown)))
+                 :complete (cl-function
+                            (lambda (&key response &allow-other-keys)
+                              (if sync
+                                  nil
+                                (handler req :response response)))))))
+    (if sync
+        (handler req :response resp)
+      resp)))
+
+;; This is almost working, need mini tweak to work
+
+(defun ghub--handle-response (buffer status req)
+  (unwind-protect
+      (progn
+        (with-current-buffer buffer
           (set-buffer-multibyte t)
           (let* ((unpaginate (ghub--req-unpaginate req))
                  (headers    (ghub--handle-response-headers status req))
@@ -559,8 +589,8 @@ and https://debbugs.gnu.org/cgi/bugreport.cgi?bug=34341.")
                         (callback
                          (funcall callback value headers status req))
                         (t value))))))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))))
 
 (defun ghub--handle-response-headers (status req)
   (goto-char (point-min))
